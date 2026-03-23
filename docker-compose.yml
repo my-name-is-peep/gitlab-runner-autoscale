@@ -6,11 +6,15 @@ services:
     restart: unless-stopped
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
-    # 👇 ВАЖНО: Добавляем процесс в группу docker хоста
     group_add:
       - 986
     env_file: .env
     environment:
-      - TZ=Europe/Moscow
+      - TZ=Asia/Omsk
+    ports:
+      - '8000:8000'  # Prometheus metrics
+    dns:
+      - 8.8.8.8
+      - 1.1.1.1
     labels:
       - 'autoscaler=true'
