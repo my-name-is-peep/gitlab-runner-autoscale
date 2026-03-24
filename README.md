@@ -1,6 +1,6 @@
 # GitLab Runner Autoscale
 
-Автоскейлер GitLab Runner — динамическое масштабирование раннеров на основе очереди задач с поддержкой профилей ресурсов и метрик Prometheus.
+Автоскейлер GitLab Runner — динамическое масштабирование раннеров на основе очереди задач с поддержкой профилей ресурсов, метрик Prometheus и расширенными возможностями мониторинга.
 
 ## Возможности
 
@@ -12,6 +12,11 @@
 - 🚑 **Самовосстановление** — автоматический перезапуск до `MIN_RUNNERS` при падении
 - 🏷️ **Профили раннеров** — small/medium/large с разными лимитами CPU/RAM
 - 📊 **Prometheus метрики** — HTTP-эндпоинт `/metrics` для мониторинга
+- 🩺 **Healthcheck и readiness** — эндпоинты `/health` и `/ready` для проверки состояния
+- 🔄 **Автоматическая очистка** — удаление остановленных контейнеров и устаревших раннеров
+- 📦 **JSON-логирование** — структурированные логи для удобного парсинга и анализа
+- 🔁 **Retry-механизм** — автоматическая повторная попытка при сбоях GitLab API
+- 📊 **Расширенные метрики** — мониторинг задержек API, ошибок и использования ресурсов
 
 ## Быстрый старт
 
@@ -81,6 +86,12 @@ docker ps --filter "name=autoscale-runner-"
 
 # Метрики Prometheus
 curl http://localhost:8000/metrics
+
+# Healthcheck
+curl http://localhost:8000/health
+
+# Readiness check
+curl http://localhost:8000/ready
 ```
 
 ## Конфигурация
@@ -101,6 +112,9 @@ curl http://localhost:8000/metrics
 | `MAX_RUNNERS` | `5` | Максимальное количество раннеров |
 | `CHECK_INTERVAL` | `30` | Интервал проверки очереди (сек) |
 | `PROJECTS_LIMIT` | `20` | Лимит проектов для проверки pending-задач |
+| `RUNNER_IMAGE` | `gitlab/gitlab-runner:latest` | Docker-образ для раннеров |
+| `RUNNER_CONCURRENT` | `2` | Количество параллельных задач по умолчанию |
+| `RUNNER_TAGS` | `shared_runner` | Теги раннера по умолчанию |
 
 ### Cooldown (защита от дребезга)
 
@@ -188,6 +202,8 @@ scrape_configs:
     static_configs:
       - targets: ['localhost:8000']
     metrics_path: /metrics
+    scrape_interval: 15s
+    scrape_timeout: 10s
 ```
 
 ### Пример Grafana dashboard
@@ -327,6 +343,15 @@ docker exec -it gitlab-autoscaler bash
 
 # Проверка метрик
 curl http://localhost:8000/metrics
+
+# Healthcheck
+curl http://localhost:8000/health
+
+# Readiness check
+curl http://localhost:8000/ready
+
+# Проверка подключения к GitLab
+curl -H "PRIVATE-TOKEN: $GITLAB_TOKEN" $GITLAB_URL/api/v4/user
 ```
 
 ## Зависимости
@@ -334,6 +359,8 @@ curl http://localhost:8000/metrics
 - `docker==7.1.0` — Docker SDK для Python
 - `requests==2.32.3` — HTTP-клиент для GitLab API
 - `prometheus-client==0.20.0` — Клиент Prometheus
+- `tenacity==8.2.3` — Библиотека для retry-механизма
+- `python-json-logger==2.0.7` — JSON-логирование
 
 ## Примеры сценариев
 
@@ -363,6 +390,27 @@ curl http://localhost:8000/metrics
 3. Scale up блокируется до снижения нагрузки
 4. В логах: "⚠️ Недостаточно CPU (85.0% >= 80.0%)"
 5. Метрика `gitlab_autoscaler_scale_up_blocked_resources_total` инкрементируется
+6. Автоскейлер продолжает мониторинг и автоматически возобновит scale up при снижении нагрузки
+```
+
+### Сценарий 5: Автоматическая очистка
+
+```
+1. Раннер упал и его контейнер остановился
+2. Через GRACEFUL_PERIOD (300с) автоскейлер обнаруживает stopped контейнер
+3. Автоматическая очистка: удаление контейнера, deregister из GitLab, удаление volume
+4. В логах: "[CLEANUP] Removed stopped runner: autoscale-runner-medium-1234567890"
+5. Метрики обновляются, количество запущенных раннеров уменьшается
+```
+
+### Сценарий 6: Healthcheck и мониторинг
+
+```
+1. Prometheus скрейпит метрики с /metrics каждые 15с
+2. Kubernetes или другой оркестратор проверяет /health и /ready эндпоинты
+3. При сбое GitLab API readiness возвращает 503, показывая что сервис не готов
+4. После восстановления подключения readiness возвращает 200 OK
+5. Логи содержат структурированные JSON-сообщения для удобного парсинга
 ```
 
 ### Сценарий 4: Разные профили для разных задач
@@ -382,3 +430,8 @@ curl http://localhost:8000/metrics
 - Cooldown применяется только после успешной операции масштабирования
 - Метрики доступны на порту `METRICS_PORT` (по умолчанию 8000)
 - **Лимиты ресурсов применяются как к раннеру, так и к создаваемым им задачам** через `config.toml`
+- Автоматическая очистка stopped контейнеров происходит каждые `CHECK_INTERVAL` секунд
+- JSON-логи содержат дополнительные поля: `timestamp`, `level`, `logger`, `function`, `line`
+- Retry-механизм использует exponential backoff (2-30с) с 5 попытками для GitLab API
+- Healthcheck проверяет доступность сервиса, readiness - доступность GitLab и Docker
+- При старте выполняется валидация конфигурации и проверка подключений
