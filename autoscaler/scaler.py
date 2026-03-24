@@ -1,22 +1,86 @@
 #!/usr/bin/env python3
 import os
+import sys
 import time
+import json
+import logging
 import docker
 import requests
-import logging
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from datetime import datetime, timedelta
 from prometheus_client import Counter, Gauge, Info, generate_latest, CONTENT_TYPE_LATEST
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+from pythonjsonlogger import jsonlogger
 
-# Настройка логирования
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
+# =============================================================================
+# JSON Logging
+# =============================================================================
 
-# Конфиг из переменных окружения
+class CustomJsonFormatter(jsonlogger.JsonFormatter):
+    """Custom JSON formatter with level and timestamp"""
+
+    def add_fields(self, log_record, record, message_dict):
+        super().add_fields(log_record, record, message_dict)
+        log_record['level'] = record.levelname
+        log_record['timestamp'] = datetime.utcnow().isoformat() + 'Z'
+        log_record['logger'] = record.name
+        if record.funcName:
+            log_record['function'] = record.funcName
+        if record.lineno:
+            log_record['line'] = record.lineno
+
+def setup_json_logging(level='INFO'):
+    """Setup JSON logging"""
+    logger = logging.getLogger()
+    logger.setLevel(getattr(logging, level.upper()))
+    
+    # Clear existing handlers
+    logger.handlers = []
+    
+    # Create JSON handler for stdout
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(CustomJsonFormatter(
+        '%(timestamp)s %(level)s %(name)s %(message)s %(function)s %(line)s'
+    ))
+    logger.addHandler(handler)
+    
+    return logger
+
+logging.basicConfig()
+logger = setup_json_logging('INFO')
+
+# =============================================================================
+# Retry logic для GitLab API
+# =============================================================================
+
+class GitLabAPIError(Exception):
+    """Ошибка GitLab API"""
+    pass
+
+class RateLimitError(Exception):
+    """Превышен лимит запросов к GitLab API"""
+    pass
+
+def create_retry_decorator():
+    """Создаёт декоратор retry с exponential backoff"""
+    return retry(
+        stop=stop_after_attempt(5),
+        wait=wait_exponential(multiplier=1, min=2, max=30),
+        retry=retry_if_exception_type((requests.exceptions.RequestException, GitLabAPIError)),
+        reraise=True,
+        before_sleep=lambda retry_state: logger.warning(
+            f'Попытка {retry_state.attempt_number} из 5, ожидание {retry_state.next_action.sleep}с',
+            extra={'attempt': retry_state.attempt_number, 'next_wait': retry_state.next_action.sleep}
+        )
+    )
+
+gitlab_retry = create_retry_decorator()
+
+# =============================================================================
+# Конфигурация
+# =============================================================================
+
 GITLAB_URL = os.getenv('GITLAB_URL', 'https://gitlab.com').strip()
 GITLAB_TOKEN = os.getenv('GITLAB_TOKEN', '').strip()
 REG_TOKEN = os.getenv('REG_TOKEN', '').strip()
@@ -38,6 +102,11 @@ RAM_THRESHOLD = float(os.getenv('RAM_THRESHOLD', '80.0'))
 
 # Graceful shutdown
 GRACEFUL_PERIOD = int(os.getenv('GRACEFUL_PERIOD', '300'))
+
+# Retry настройки
+MAX_RETRIES = int(os.getenv('MAX_RETRIES', '5'))
+RETRY_BASE_DELAY = float(os.getenv('RETRY_BASE_DELAY', '2.0'))
+RETRY_MAX_DELAY = float(os.getenv('RETRY_MAX_DELAY', '30.0'))
 
 # Профили раннеров
 DEFAULT_RUNNER_PROFILE = os.getenv('DEFAULT_RUNNER_PROFILE', 'medium').strip()
@@ -62,30 +131,183 @@ RUNNER_PROFILES = {
     },
 }
 
-# Валидация
-if MIN_RUNNERS > MAX_RUNNERS:
-    logger.warning(f'⚠️ MIN_RUNNERS ({MIN_RUNNERS}) > MAX_RUNNERS ({MAX_RUNNERS}), устанавливаем MIN=MAX')
-    MIN_RUNNERS = MAX_RUNNERS
+# =============================================================================
+# Валидация конфигурации
+# =============================================================================
 
-if DEFAULT_RUNNER_PROFILE not in RUNNER_PROFILES:
-    logger.warning(f'⚠️ Неизвестный профиль {DEFAULT_RUNNER_PROFILE}, используем medium')
-    DEFAULT_RUNNER_PROFILE = 'medium'
+class ConfigValidationError(Exception):
+    """Ошибка валидации конфигурации"""
+    pass
 
-docker_client = docker.from_env()
+def validate_config():
+    """
+    Валидирует конфигурацию при старте.
+    Выбрасывает ConfigValidationError при критических ошибках.
+    """
+    errors = []
+    warnings = []
 
-# Глобальное состояние для cooldown
+    # Проверка обязательных переменных
+    if not GITLAB_URL:
+        errors.append('GITLAB_URL не указан')
+    elif not GITLAB_URL.startswith(('http://', 'https://')):
+        errors.append(f'GITLAB_URL должен начинаться с http:// или https:// (получено: {GITLAB_URL})')
+
+    if not GITLAB_TOKEN:
+        errors.append('GITLAB_TOKEN не указан')
+    elif len(GITLAB_TOKEN) < 10:
+        errors.append(f'GITLAB_TOKEN слишком короткий (длина: {len(GITLAB_TOKEN)})')
+
+    if not REG_TOKEN:
+        errors.append('REG_TOKEN не указан')
+
+    # Проверка диапазонов
+    if MIN_RUNNERS < 0:
+        errors.append(f'MIN_RUNNERS не может быть отрицательным ({MIN_RUNNERS})')
+    
+    if MAX_RUNNERS < 1:
+        errors.append(f'MAX_RUNNERS должен быть >= 1 ({MAX_RUNNERS})')
+    
+    if MIN_RUNNERS > MAX_RUNNERS:
+        warnings.append(f'MIN_RUNNERS ({MIN_RUNNERS}) > MAX_RUNNERS ({MAX_RUNNERS}) — будет установлено MIN=MAX')
+
+    if CHECK_INTERVAL < 5:
+        warnings.append(f'CHECK_INTERVAL слишком маленький ({CHECK_INTERVAL}с), рекомендуется >= 30с')
+
+    if SCALE_UP_COOLDOWN < 10:
+        warnings.append(f'SCALE_UP_COOLDOWN слишком маленький ({SCALE_UP_COOLDOWN}с), рекомендуется >= 30с')
+
+    if SCALE_DOWN_COOLDOWN < 30:
+        warnings.append(f'SCALE_DOWN_COOLDOWN слишком маленький ({SCALE_DOWN_COOLDOWN}с), рекомендуется >= 60с')
+
+    if not (0 < CPU_THRESHOLD <= 100):
+        errors.append(f'CPU_THRESHOLD должен быть в диапазоне (0, 100] ({CPU_THRESHOLD})')
+
+    if not (0 < RAM_THRESHOLD <= 100):
+        errors.append(f'RAM_THRESHOLD должен быть в диапазоне (0, 100] ({RAM_THRESHOLD})')
+
+    if DEFAULT_RUNNER_PROFILE not in RUNNER_PROFILES:
+        errors.append(f'Неизвестный профиль DEFAULT_RUNNER_PROFILE: {DEFAULT_RUNNER_PROFILE} (доступны: {list(RUNNER_PROFILES.keys())})')
+
+    # Проверка профилей
+    for profile_name, profile_config in RUNNER_PROFILES.items():
+        if profile_config['concurrent'] < 1:
+            errors.append(f'PROFILE_{profile_name.upper()}_CONCURRENT должен быть >= 1 ({profile_config["concurrent"]})')
+        if profile_config['cpu_limit'] <= 0:
+            errors.append(f'PROFILE_{profile_name.upper()}_CPU_LIMIT должен быть > 0 ({profile_config["cpu_limit"]})')
+
+    # Log warnings
+    for warning in warnings:
+        logger.warning(f'[CONFIG] {warning}', extra={'validation': 'warning'})
+
+    # Raise error if critical issues exist
+    if errors:
+        for error in errors:
+            logger.error(f'[CONFIG] {error}', extra={'validation': 'error'})
+        raise ConfigValidationError(f'Critical configuration errors: {"; ".join(errors)}')
+
+    logger.info('[CONFIG] Configuration validated successfully', extra={
+        'config': {
+            'gitlab_url': GITLAB_URL,
+            'min_runners': MIN_RUNNERS,
+            'max_runners': MAX_RUNNERS,
+            'check_interval': CHECK_INTERVAL,
+            'default_profile': DEFAULT_RUNNER_PROFILE,
+        }
+    })
+
+def validate_gitlab_connection():
+    """
+    Проверяет подключение к GitLab и валидность токена.
+    Выбрасывает exception при ошибке.
+    """
+    try:
+        resp = requests.get(
+            f'{GITLAB_URL}/api/v4/user',
+            headers={'PRIVATE-TOKEN': GITLAB_TOKEN},
+            timeout=10
+        )
+        
+        if resp.status_code == 401:
+            raise ConfigValidationError('GITLAB_TOKEN недействителен (401 Unauthorized)')
+        elif resp.status_code == 403:
+            raise ConfigValidationError('GITLAB_TOKEN недостаточен для доступа к API (403 Forbidden)')
+        elif resp.status_code != 200:
+            raise ConfigValidationError(f'GitLab вернул статус {resp.status_code}')
+        
+        user = resp.json()
+        logger.info(f'[GITLAB] Connected successfully: {user.get("username")} ({user.get("name")})', extra={
+            'gitlab': {
+                'url': GITLAB_URL,
+                'user': user.get('username', 'unknown'),
+                'name': user.get('name', 'unknown'),
+            }
+        })
+        
+    except requests.exceptions.ConnectionError as e:
+        raise ConfigValidationError(f'Не удалось подключиться к GitLab ({GITLAB_URL}): {e}')
+    except requests.exceptions.Timeout:
+        raise ConfigValidationError(f'Превышено время ожидания подключения к GitLab ({GITLAB_URL})')
+    except ConfigValidationError:
+        raise
+    except Exception as e:
+        raise ConfigValidationError(f'Ошибка проверки подключения к GitLab: {e}')
+
+def validate_docker_connection(docker_client):
+    """
+    Проверяет подключение к Docker.
+    Выбрасывает exception при ошибке.
+    """
+    try:
+        info = docker_client.info()
+        logger.info(f'[DOCKER] Connected successfully: Docker {info.get("ServerVersion")} on {info.get("OperatingSystem")}', extra={
+            'docker': {
+                'version': info.get('ServerVersion', 'unknown'),
+                'containers_running': info.get('ContainersRunning', 0),
+                'os': info.get('OperatingSystem', 'unknown'),
+            }
+        })
+    except Exception as e:
+        raise ConfigValidationError(f'Docker connection error: {e}')
+
+# =============================================================================
+# Инициализация Docker клиента (после валидации конфига)
+# =============================================================================
+
+try:
+    docker_client = docker.from_env()
+except Exception as e:
+    logger.error(f'Failed to initialize Docker client: {e}')
+    docker_client = None
+
+# =============================================================================
+# Глобальное состояние
+# =============================================================================
+
 last_scale_up_time = None
 last_scale_down_time = None
 
-# Состояние для метрик
 current_pending_jobs = 0
 current_running_runners = 0
+current_running_jobs = 0
 runners_by_profile = {'small': 0, 'medium': 0, 'large': 0}
 
+# Статистика для метрик
+api_request_count = 0
+api_error_count = 0
+last_gitlab_check = None
+
+# =============================================================================
 # Prometheus метрики
+# =============================================================================
+
 metrics_pending_jobs = Gauge(
     'gitlab_autoscaler_pending_jobs',
     'Количество pending-задач в GitLab'
+)
+metrics_running_jobs = Gauge(
+    'gitlab_autoscaler_running_jobs',
+    'Количество running-задач в GitLab'
 )
 metrics_running_runners = Gauge(
     'gitlab_autoscaler_running_runners',
@@ -128,34 +350,96 @@ metrics_host_ram_percent = Gauge(
     'gitlab_autoscaler_host_ram_percent',
     'Использование RAM хоста'
 )
+metrics_api_requests_total = Counter(
+    'gitlab_autoscaler_api_requests_total',
+    'Общее количество запросов к GitLab API',
+    ['status']
+)
+metrics_api_latency_seconds = Gauge(
+    'gitlab_autoscaler_api_latency_seconds',
+    'Последняя задержка запроса к GitLab API'
+)
+metrics_uptime_seconds = Gauge(
+    'gitlab_autoscaler_uptime_seconds',
+    'Время работы автоскейлера в секундах'
+)
 metrics_autoscaler_info = Info(
     'gitlab_autoscaler',
     'Информация об автоскейлере'
 )
+
+startup_time = datetime.now()
 metrics_autoscaler_info.info({
     'gitlab_url': GITLAB_URL,
     'min_runners': str(MIN_RUNNERS),
     'max_runners': str(MAX_RUNNERS),
     'check_interval': str(CHECK_INTERVAL),
     'default_profile': DEFAULT_RUNNER_PROFILE,
+    'version': '1.0.0',
 })
 
+# =============================================================================
+# HTTP сервер для метрик и healthcheck
+# =============================================================================
 
 class MetricsHandler(BaseHTTPRequestHandler):
-    """HTTP-обработчик для метрик Prometheus"""
+    """HTTP-обработчик для метрик Prometheus и healthcheck"""
 
     def do_GET(self):
         if self.path == '/metrics':
-            self.send_response(200)
-            self.send_header('Content-Type', CONTENT_TYPE_LATEST)
-            self.end_headers()
-            self.wfile.write(generate_latest())
+            self.handle_metrics()
+        elif self.path == '/health':
+            self.handle_health()
+        elif self.path == '/ready':
+            self.handle_ready()
         else:
             self.send_response(404)
             self.end_headers()
 
+    def handle_metrics(self):
+        self.send_response(200)
+        self.send_header('Content-Type', CONTENT_TYPE_LATEST)
+        self.end_headers()
+        self.wfile.write(generate_latest())
+
+    def handle_health(self):
+        """
+        Проверка здоровья сервиса.
+        Возвращает 200 OK если сервис работает.
+        """
+        self.send_response(200)
+        self.send_header('Content-Type', 'application/json')
+        self.end_headers()
+        response = {
+            'status': 'healthy',
+            'timestamp': datetime.utcnow().isoformat() + 'Z',
+            'service': 'gitlab-autoscaler',
+            'uptime_seconds': (datetime.now() - startup_time).total_seconds(),
+        }
+        self.wfile.write(json.dumps(response).encode())
+
+    def handle_ready(self):
+        """
+        Проверка готовности сервиса.
+        Возвращает 200 OK если сервис готов к работе (подключен к GitLab и Docker).
+        """
+        is_ready = docker_client is not None and last_gitlab_check is not None
+        
+        self.send_response(200 if is_ready else 503)
+        self.send_header('Content-Type', 'application/json')
+        self.end_headers()
+        response = {
+            'ready': is_ready,
+            'timestamp': datetime.utcnow().isoformat() + 'Z',
+            'checks': {
+                'docker': docker_client is not None,
+                'gitlab': last_gitlab_check is not None,
+            }
+        }
+        self.wfile.write(json.dumps(response).encode())
+
     def log_message(self, format, *args):
-        logger.debug(f'Metrics: {args}')
+        logger.debug(f'HTTP request: {args}')
 
 
 def start_metrics_server(port=8000):
@@ -163,14 +447,148 @@ def start_metrics_server(port=8000):
     server = HTTPServer(('0.0.0.0', port), MetricsHandler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
-    logger.info(f'📊 Prometheus metrics доступны на http://0.0.0.0:{port}/metrics')
+    logger.info(f'[METRICS] Prometheus available on port {port}', extra={
+        'metrics': {'port': port, 'endpoints': ['/metrics', '/health', '/ready']}
+    })
     return server
 
+# =============================================================================
+# GitLab API функции с retry
+# =============================================================================
+
+@retry(
+    stop=stop_after_attempt(5),
+    wait=wait_exponential(multiplier=1, min=2, max=30),
+    retry=retry_if_exception_type((requests.exceptions.RequestException, GitLabAPIError, RateLimitError)),
+    reraise=True,
+    before_sleep=lambda retry_state: logger.warning(
+        f'Попытка {retry_state.attempt_number} из 5, ожидание {retry_state.next_action.sleep}с',
+        extra={'attempt': retry_state.attempt_number, 'next_wait': retry_state.next_action.sleep}
+    )
+)
+def gitlab_get(url, params=None, timeout=10):
+    """GET запрос к GitLab API с retry"""
+    global api_request_count, api_error_count
+    
+    start_time = time.time()
+    api_request_count += 1
+    
+    try:
+        resp = requests.get(
+            url,
+            params=params,
+            headers={'PRIVATE-TOKEN': GITLAB_TOKEN},
+            timeout=timeout
+        )
+        
+        latency = time.time() - start_time
+        metrics_api_latency_seconds.set(latency)
+        
+        if resp.status_code == 429:
+            retry_after = int(resp.headers.get('Retry-After', 30))
+            logger.warning(f'Rate limit exceeded, waiting {retry_after}s', extra={
+                'gitlab': {'rate_limit': True, 'retry_after': retry_after}
+            })
+            metrics_api_requests_total.labels(status='rate_limited').inc()
+            time.sleep(retry_after)
+            raise RateLimitError(f'Rate limit exceeded, retry after {retry_after}s')
+        
+        if resp.status_code >= 500:
+            metrics_api_requests_total.labels(status='server_error').inc()
+            api_error_count += 1
+            raise GitLabAPIError(f'GitLab server error: {resp.status_code}')
+        
+        if resp.status_code >= 400:
+            metrics_api_requests_total.labels(status='client_error').inc()
+            api_error_count += 1
+            logger.error(f'GitLab API error: {resp.status_code}', extra={
+                'gitlab': {'url': url, 'status': resp.status_code}
+            })
+        
+        metrics_api_requests_total.labels(status='success').inc()
+        resp.raise_for_status()
+        return resp
+        
+    except requests.exceptions.Timeout as e:
+        metrics_api_requests_total.labels(status='timeout').inc()
+        api_error_count += 1
+        logger.error(f'GitLab API timeout: {url}', extra={'gitlab': {'url': url}})
+        raise
+    except requests.exceptions.ConnectionError as e:
+        metrics_api_requests_total.labels(status='connection_error').inc()
+        api_error_count += 1
+        logger.error(f'GitLab API connection error: {url}', extra={'gitlab': {'url': url}})
+        raise
+
+def gitlab_get_runners():
+    """Получает список всех раннеров из GitLab"""
+    runners = []
+    page = 1
+
+    while True:
+        resp = gitlab_get(
+            f'{GITLAB_URL}/api/v4/runners/all',
+            params={'per_page': 100, 'page': page},
+            timeout=10
+        )
+        page_runners = resp.json()
+
+        if not page_runners:
+            break
+
+        runners.extend(page_runners)
+
+        # Безопасный парсинг заголовка (может быть пустой строкой)
+        next_page = resp.headers.get('X-Next-Page', '')
+        if not next_page:
+            break
+        page += 1
+
+    return runners
+
+def gitlab_get_runner_jobs(runner_id):
+    """Получает активные джобы раннера"""
+    resp = gitlab_get(
+        f'{GITLAB_URL}/api/v4/runners/{runner_id}/jobs',
+        params={'scope': ['running', 'pending']},
+        timeout=10
+    )
+    return resp.json()
+
+def gitlab_deregister_runner(runner_id):
+    """Remove runner from GitLab"""
+    try:
+        resp = requests.delete(
+            f'{GITLAB_URL}/api/v4/runners/{runner_id}',
+            headers={'PRIVATE-TOKEN': GITLAB_TOKEN},
+            timeout=10
+        )
+
+        if resp.status_code == 204:
+            logger.info(f'[GITLAB] Runner removed: id={runner_id}', extra={'gitlab': {'runner_id': runner_id}})
+            return True
+        elif resp.status_code == 404:
+            logger.info(f'[GITLAB] Runner already removed: id={runner_id}', extra={'gitlab': {'runner_id': runner_id}})
+            return True
+        else:
+            logger.warning(f'[GITLAB] Failed to remove runner: status {resp.status_code}, id={runner_id}', extra={
+                'gitlab': {'runner_id': runner_id, 'status': resp.status_code}
+            })
+            return False
+    except Exception as e:
+        logger.error(f'[GITLAB] Deregister error for runner {runner_id}: {e}', extra={
+            'gitlab': {'runner_id': runner_id, 'error': str(e)}
+        })
+        return False
+
+# =============================================================================
+# Функции работы с хостом
+# =============================================================================
 
 def get_host_resources():
     """
-    Получаем текущее использование CPU и RAM хоста.
-    Возвращает кортеж (cpu_percent, ram_percent).
+    Get current host CPU and RAM usage.
+    Returns tuple (cpu_percent, ram_percent).
     """
     try:
         containers = docker_client.containers.list()
@@ -182,7 +600,7 @@ def get_host_resources():
             try:
                 stats = container.stats(stream=False)
 
-                # CPU — нормализуем на количество CPU хоста
+                # CPU — normalize by host CPU count
                 num_cpus = stats['cpu_stats'].get('online_cpus') or \
                            len(stats['cpu_stats']['cpu_usage'].get('percpu_usage', [1]))
                 cpu_delta = stats['cpu_stats']['cpu_usage']['total_usage'] - \
@@ -192,7 +610,7 @@ def get_host_resources():
                 cpu_percent = (cpu_delta / system_delta) * num_cpus * 100.0 if system_delta > 0 else 0
                 cpu_total += cpu_percent
 
-                # RAM — вычитаем cache (page cache не является "реальным" потреблением)
+                # RAM — subtract cache (page cache is not "real" usage)
                 mem_stats = stats['memory_stats']
                 mem_usage = mem_stats.get('usage', 0)
                 mem_cache = mem_stats.get('stats', {}).get('cache', 0)
@@ -200,22 +618,22 @@ def get_host_resources():
             except Exception:
                 continue
 
-        # Получаем общую RAM хоста
+        # Get total host RAM
         info = docker_client.info()
         host_ram_total = info.get('MemTotal', 1)
         host_ram_percent = (ram_used / host_ram_total) * 100.0 if host_ram_total > 0 else 0
 
         return cpu_total, host_ram_percent
     except Exception as e:
-        logger.error(f'❌ Ошибка получения ресурсов хоста: {e}')
+        logger.error(f'Failed to get host resources', extra={'error': str(e)})
         return 0.0, 0.0
 
 
 def can_scale_up():
     """
-    Проверяет, можно ли масштабироваться вверх:
-    1. Прошёл ли cooldown после последнего scale up
-    2. Достаточно ли ресурсов на хосте
+    Check if we can scale up:
+    1. Cooldown period passed since last scale up
+    2. Sufficient host resources available
     """
     global last_scale_up_time
 
@@ -223,24 +641,31 @@ def can_scale_up():
         elapsed = (datetime.now() - last_scale_up_time).total_seconds()
         if elapsed < SCALE_UP_COOLDOWN:
             remaining = int(SCALE_UP_COOLDOWN - elapsed)
-            logger.info(f'⏳ Cooldown scale up: осталось {remaining} сек')
+            logger.info(f'[COOLDOWN] Scale up: waiting {remaining}s', extra={
+                'cooldown': {'type': 'scale_up', 'remaining': remaining}
+            })
             metrics_scale_up_blocked_cooldown.inc()
             return False
 
     cpu_percent, ram_percent = get_host_resources()
-    logger.info(f'📊 Ресурсы хоста: CPU={cpu_percent:.1f}%, RAM={ram_percent:.1f}% '
-                f'(пороги: CPU={CPU_THRESHOLD}%, RAM={RAM_THRESHOLD}%)')
+    logger.info(f'[RESOURCES] Host: CPU={cpu_percent:.1f}%, RAM={ram_percent:.1f}% (threshold: {CPU_THRESHOLD}%, {RAM_THRESHOLD}%)', extra={
+        'resources': {'cpu': cpu_percent, 'ram': ram_percent}
+    })
 
     metrics_host_cpu_percent.set(cpu_percent)
     metrics_host_ram_percent.set(ram_percent)
 
     if cpu_percent >= CPU_THRESHOLD:
-        logger.warning(f'⚠️ Недостаточно CPU ({cpu_percent:.1f}% >= {CPU_THRESHOLD}%)')
+        logger.warning(f'[BLOCKED] Insufficient CPU: {cpu_percent:.1f}% >= {CPU_THRESHOLD}%', extra={
+            'resources': {'cpu': cpu_percent, 'threshold': CPU_THRESHOLD}
+        })
         metrics_scale_up_blocked_resources.inc()
         return False
 
     if ram_percent >= RAM_THRESHOLD:
-        logger.warning(f'⚠️ Недостаточно RAM ({ram_percent:.1f}% >= {RAM_THRESHOLD}%)')
+        logger.warning(f'[BLOCKED] Insufficient RAM: {ram_percent:.1f}% >= {RAM_THRESHOLD}%', extra={
+            'resources': {'ram': ram_percent, 'threshold': RAM_THRESHOLD}
+        })
         metrics_scale_up_blocked_resources.inc()
         return False
 
@@ -249,8 +674,8 @@ def can_scale_up():
 
 def can_scale_down():
     """
-    Проверяет, можно ли масштабироваться вниз:
-    1. Прошёл ли cooldown после последнего scale down
+    Check if we can scale down:
+    1. Cooldown period passed since last scale down
     """
     global last_scale_down_time
 
@@ -258,26 +683,25 @@ def can_scale_down():
         elapsed = (datetime.now() - last_scale_down_time).total_seconds()
         if elapsed < SCALE_DOWN_COOLDOWN:
             remaining = int(SCALE_DOWN_COOLDOWN - elapsed)
-            logger.info(f'⏳ Cooldown scale down: осталось {remaining} сек')
+            logger.info(f'[COOLDOWN] Scale down: waiting {remaining}s', extra={
+                'cooldown': {'type': 'scale_down', 'remaining': remaining}
+            })
             metrics_scale_down_blocked_cooldown.inc()
             return False
 
     return True
 
+# =============================================================================
+# Функции работы с раннерами
+# =============================================================================
 
 def get_runner_active_jobs(container):
     """
-    Проверяет, есть ли у раннера активные джобы.
-    Возвращает количество активных задач.
+    Check if runner has active jobs.
+    Returns number of truly active (running/pending) jobs.
     """
     try:
-        runners_resp = requests.get(
-            f'{GITLAB_URL}/api/v4/runners',
-            headers={'PRIVATE-TOKEN': GITLAB_TOKEN},
-            timeout=10
-        )
-        runners_resp.raise_for_status()
-        runners = runners_resp.json()
+        runners = gitlab_get_runners()
 
         runner_id = None
         for runner in runners:
@@ -286,24 +710,32 @@ def get_runner_active_jobs(container):
                 break
 
         if runner_id is None:
-            logger.warning(f'⚠️ Раннер {container.name} не найден в GitLab')
+            logger.warning(f'Runner not found in GitLab', extra={'container': container.name})
             return 0
 
-        jobs_resp = requests.get(
+        # Get all jobs and filter only truly active ones
+        all_jobs_resp = gitlab_get(
             f'{GITLAB_URL}/api/v4/runners/{runner_id}/jobs',
-            params={'scope': ['running', 'pending']},
-            headers={'PRIVATE-TOKEN': GITLAB_TOKEN},
+            params={'per_page': 100},
             timeout=10
         )
+        all_jobs = all_jobs_resp.json()
 
-        if jobs_resp.status_code == 200:
-            active_jobs = len(jobs_resp.json())
-            if active_jobs > 0:
-                logger.info(f'📋 У {container.name} активных джоб: {active_jobs}')
-            return active_jobs
-        return 0
+        # Count only running/pending jobs
+        active_jobs = sum(1 for job in all_jobs if job.get('status') in ['running', 'pending'])
+
+        if active_jobs > 0:
+            logger.info(f'Runner has active jobs', extra={
+                'container': container.name,
+                'active_jobs': active_jobs
+            })
+        return active_jobs
+
     except Exception as e:
-        logger.error(f'❌ Ошибка проверки джоб раннера {container.name}: {e}')
+        logger.error(f'Failed to check runner jobs', extra={
+            'container': container.name,
+            'error': str(e)
+        })
         return 0
 
 
@@ -328,7 +760,7 @@ def get_runner_profile(container):
 
 
 def count_runners_by_profile():
-    """Подсчитывает количество раннеров по профилям"""
+    """Count runners by profile"""
     global runners_by_profile
     runners_by_profile = {'small': 0, 'medium': 0, 'large': 0}
 
@@ -341,137 +773,78 @@ def count_runners_by_profile():
             if profile in runners_by_profile:
                 runners_by_profile[profile] += 1
     except Exception as e:
-        logger.error(f'❌ Ошибка подсчёта раннеров по профилям: {e}')
+        logger.error(f'Failed to count runners by profile', extra={'error': str(e)})
 
     return runners_by_profile
 
 
 def get_queue_stats():
-    """Считаем pending и running jobs по всем доступным проектам"""
+    """Get pending and running jobs count from all available projects"""
     try:
-        projects_resp = requests.get(
+        projects_resp = gitlab_get(
             f'{GITLAB_URL}/api/v4/projects',
             params={'per_page': PROJECTS_LIMIT, 'order_by': 'last_activity_at', 'sort': 'desc'},
-            headers={'PRIVATE-TOKEN': GITLAB_TOKEN},
             timeout=15
         )
-        projects_resp.raise_for_status()
         projects = projects_resp.json()
 
         total_pending = 0
         total_running = 0
+
         for project in projects:
-            for scope, counter_ref in [('pending', 'p'), ('running', 'r')]:
+            for scope in ['pending', 'running']:
                 try:
-                    jobs_resp = requests.get(
+                    jobs_resp = gitlab_get(
                         f'{GITLAB_URL}/api/v4/projects/{project["id"]}/jobs',
                         params={'scope': scope, 'per_page': 100},
-                        headers={'PRIVATE-TOKEN': GITLAB_TOKEN},
                         timeout=5
                     )
-                    if jobs_resp.status_code == 200:
-                        x_total = jobs_resp.headers.get('X-Total')
-                        count = int(x_total) if x_total is not None else len(jobs_resp.json())
-                        if scope == 'pending':
-                            total_pending += count
-                        else:
-                            total_running += count
-                except:
+                    x_total = jobs_resp.headers.get('X-Total')
+                    count = int(x_total) if x_total is not None else len(jobs_resp.json())
+
+                    if scope == 'pending':
+                        total_pending += count
+                    else:
+                        total_running += count
+                except Exception:
                     continue
+
         return total_pending, total_running
+
     except Exception as e:
-        logger.error(f'❌ Ошибка GitLab API: {e}')
+        logger.error(f'Failed to get queue stats', extra={'error': str(e)})
         return 0, 0
 
 
-def get_pending_jobs():
-    """Обратная совместимость — возвращает только pending"""
-    pending, _ = get_queue_stats()
-    return pending
-
-
 def get_running_runners():
-    """Считаем запущенные контейнеры-раннеры"""
+    """Count running runner containers"""
     try:
         containers = docker_client.containers.list(
             filters={'name': 'autoscale-runner-', 'status': 'running'}
         )
         return len(containers)
     except Exception as e:
-        logger.error(f'❌ Ошибка Docker API: {e}')
+        logger.error(f'Failed to get running runners', extra={'error': str(e)})
         return 0
 
 
-def write_runner_config(volume_name, config_content):
-    """
-    Записывает config.toml в Docker volume через временный контейнер.
-    Использует base64 для безопасной передачи содержимого (обходит проблемы
-    с кавычками и спецсимволами в shell-команде echo).
-    """
-    import base64
-    encoded = base64.b64encode(config_content.encode()).decode()
-    docker_client.containers.run(
-        image='alpine:latest',
-        name=f'{volume_name}-config-writer',
-        volumes=[f'{volume_name}:/etc/gitlab-runner'],
-        command=['sh', '-c', f'echo {encoded} | base64 -d > /etc/gitlab-runner/config.toml'],
-        remove=True
-    )
-
-
-def generate_runner_config(profile, profile_config):
-    """
-    Генерирует config.toml для GitLab Runner с лимитами ресурсов для задач.
-    """
-    # Преобразуем memory_limit в байты
-    mem_limit = profile_config['memory_limit']
-    if mem_limit.endswith('m'):
-        mem_bytes = int(mem_limit[:-1]) * 1024 * 1024
-    elif mem_limit.endswith('g'):
-        mem_bytes = int(mem_limit[:-1]) * 1024 * 1024 * 1024
-    elif mem_limit.endswith('k'):
-        mem_bytes = int(mem_limit[:-1]) * 1024
-    else:
-        mem_bytes = int(mem_limit)
-
-    config = f"""concurrent = {profile_config['concurrent']}
-check_interval = 0
-
-[session_server]
-  session_timeout = 1800
-
-[[runners]]
-  name = "Auto {profile} runner"
-  url = "{GITLAB_URL}"
-  token = "{{TOKEN}}"
-  executor = "docker"
-  shell = "sh"
-  [runners.custom_build_dir]
-    enabled = false
-  [runners.cache]
-    Type = "local"
-    Path = ""
-  [runners.docker]
-    tls_verify = false
-    image = "alpine:latest"
-    privileged = false
-    disable_entrypoint_overwrite = false
-    disable_cache = false
-    volumes = ["/cache", "/var/run/docker.sock:/var/run/docker.sock"]
-    shm_size = 0
-    allowed_images = ["*"]
-    allowed_services = ["*"]
-    memory = {mem_bytes}
-    memory_swap = 0
-    oom_kill_disable = false
-"""
-    return config
+def get_stopped_runners():
+    """Get list of stopped runner containers"""
+    try:
+        containers = docker_client.containers.list(
+            filters={'name': 'autoscale-runner-', 'status': 'exited'},
+            all=True
+        )
+        return containers
+    except Exception as e:
+        logger.error(f'Failed to get stopped runners', extra={'error': str(e)})
+        return []
 
 
 def start_runner(profile=None):
     """
-    Запускаем новый контейнер-раннер с указанным профилем.
-    profile: 'small', 'medium', 'large' или None (используется DEFAULT_RUNNER_PROFILE)
+    Start a new runner container with specified profile.
+    profile: 'small', 'medium', 'large' or None (uses DEFAULT_RUNNER_PROFILE)
     """
     global last_scale_up_time
 
@@ -479,21 +852,21 @@ def start_runner(profile=None):
         profile = DEFAULT_RUNNER_PROFILE
 
     if profile not in RUNNER_PROFILES:
-        logger.warning(f'⚠️ Неизвестный профиль {profile}, используем default')
+        logger.warning(f'Unknown profile, using default', extra={
+            'requested_profile': profile,
+            'using_profile': DEFAULT_RUNNER_PROFILE
+        })
         profile = DEFAULT_RUNNER_PROFILE
 
     profile_config = RUNNER_PROFILES[profile]
     name = f'autoscale-runner-{profile}-{int(time.time())}'
 
     try:
-        # Шаг 1: Регистрируем раннер (временный контейнер)
-        # register создаёт config.toml с реальным токеном — не перезаписываем его!
+        # Step 1: Register runner (temporary container)
         docker_client.containers.run(
             image=RUNNER_IMAGE,
             name=f'{name}-register',
-            volumes=[
-                f'{name}-config:/etc/gitlab-runner'
-            ],
+            volumes=[f'{name}-config:/etc/gitlab-runner'],
             command=[
                 'register', '--non-interactive',
                 '--url', GITLAB_URL,
@@ -509,8 +882,7 @@ def start_runner(profile=None):
             detach=False
         )
 
-        # Шаг 2: Патчим memory limit в уже созданном config.toml через sed
-        # НЕ перезаписываем весь файл — в нём уже есть реальный токен от register
+        # Step 2: Patch memory limit in config.toml
         mem_limit = profile_config['memory_limit']
         if mem_limit.endswith('m'):
             mem_bytes = int(mem_limit[:-1]) * 1024 * 1024
@@ -531,7 +903,7 @@ def start_runner(profile=None):
             remove=True
         )
 
-        # Шаг 3: Запускаем постоянный контейнер с лимитами ресурсов
+        # Step 3: Start permanent container with resource limits
         docker_client.containers.run(
             image=RUNNER_IMAGE,
             name=name,
@@ -546,16 +918,19 @@ def start_runner(profile=None):
                 'autoscale-runner': 'true',
                 'runner-profile': profile,
             },
-            # Лимиты ресурсов для самого раннера
             nano_cpus=int(profile_config['cpu_limit'] * 1e9),
             mem_limit=profile_config['memory_limit'],
         )
 
-        logger.info(f'🚀 Запущен: {name} (профиль: {profile})')
-        logger.info(f'📋 Лимиты для задач: CPU={profile_config["cpu_limit"]}, RAM={profile_config["memory_limit"]}')
+        logger.info(f'[SCALE UP] Runner started: {name} (profile: {profile}, CPU: {profile_config["cpu_limit"]}, RAM: {profile_config["memory_limit"]})', extra={
+            'action': 'scale_up',
+            'container': name,
+            'profile': profile,
+            'cpu_limit': profile_config['cpu_limit'],
+            'memory_limit': profile_config['memory_limit'],
+        })
 
-        # Ждём пока контейнер действительно перейдёт в running
-        # иначе следующий цикл не увидит его и снова сделает scale up
+        # Wait for container to be running
         for _ in range(15):
             time.sleep(1)
             try:
@@ -570,15 +945,17 @@ def start_runner(profile=None):
         return True
 
     except Exception as e:
-        logger.error(f'❌ Ошибка запуска раннера: {e}')
-        try:
-            docker_client.containers.get(f'{name}-register').remove(force=True)
-        except:
-            pass
-        try:
-            docker_client.containers.get(f'{name}-config-patcher').remove(force=True)
-        except:
-            pass
+        logger.error(f'Failed to start runner', extra={
+            'error': str(e),
+            'container': name,
+            'profile': profile
+        })
+        # Cleanup
+        for suffix in ['-register', '-config-patcher', '']:
+            try:
+                docker_client.containers.get(f'{name}{suffix}').remove(force=True)
+            except:
+                pass
         try:
             docker_client.volumes.get(f'{name}-config').remove()
         except:
@@ -588,121 +965,123 @@ def start_runner(profile=None):
 
 def get_runner_id_by_container(container):
     """
-    Находит ID раннера в GitLab по имени контейнера.
-    Ищет по всем типам раннеров (instance, project, group).
-    Возвращает runner_id или None.
+    Find runner ID in GitLab by container name.
     """
     try:
-        page = 1
-        while True:
-            resp = requests.get(
-                f'{GITLAB_URL}/api/v4/runners/all',
-                params={'per_page': 100, 'page': page},
-                headers={'PRIVATE-TOKEN': GITLAB_TOKEN},
-                timeout=10
-            )
-            resp.raise_for_status()
-            runners = resp.json()
-            if not runners:
-                break
-            for runner in runners:
-                if container.name in runner.get('description', ''):
-                    return runner['id']
-            # Проверяем есть ли следующая страница
-            if int(resp.headers.get('X-Next-Page', 0)) == 0:
-                break
-            page += 1
+        runners = gitlab_get_runners()
+
+        for runner in runners:
+            if container.name in runner.get('description', ''):
+                return runner['id']
+
     except Exception as e:
-        logger.error(f'❌ Ошибка поиска раннера в GitLab: {e}')
+        logger.error(f'Failed to find runner in GitLab', extra={
+            'container': container.name,
+            'error': str(e)
+        })
     return None
 
 
 def cleanup_stale_gitlab_runners():
     """
-    При старте скейлера удаляет из GitLab раннеры которые зарегистрированы
-    как autoscale-раннеры но их контейнеры уже не существуют.
-    Защищает от накопления мёртвых раннеров после краша или рестарта.
+    Remove stale GitLab runners that are registered but their containers no longer exist.
     """
-    logger.info('🧹 Проверка мёртвых раннеров в GitLab...')
+    logger.info('[CLEANUP] Searching for stale runners in GitLab...')
     try:
-        # Получаем все живые контейнеры-раннеры
         live_containers = set()
         for c in docker_client.containers.list(filters={'name': 'autoscale-runner-'}):
             live_containers.add(c.name)
 
-        # Получаем все раннеры из GitLab
-        page = 1
+        runners = gitlab_get_runners()
         stale_count = 0
-        while True:
-            resp = requests.get(
-                f'{GITLAB_URL}/api/v4/runners/all',
-                params={'per_page': 100, 'page': page},
-                headers={'PRIVATE-TOKEN': GITLAB_TOKEN},
-                timeout=10
-            )
-            resp.raise_for_status()
-            runners = resp.json()
-            if not runners:
-                break
 
-            for runner in runners:
-                desc = runner.get('description', '')
-                # Это наш раннер если описание начинается с "Auto " и содержит "autoscale-runner-"
-                if 'autoscale-runner-' in desc:
-                    # Извлекаем имя контейнера из описания (формат: "Auto medium autoscale-runner-medium-TIMESTAMP")
-                    container_name = None
-                    for part in desc.split():
-                        if part.startswith('autoscale-runner-'):
-                            container_name = part
-                            break
+        for runner in runners:
+            desc = runner.get('description', '')
+            if 'autoscale-runner-' in desc:
+                container_name = None
+                for part in desc.split():
+                    if part.startswith('autoscale-runner-'):
+                        container_name = part
+                        break
 
-                    if container_name and container_name not in live_containers:
-                        logger.warning(f'🗑️ Мёртвый раннер в GitLab: {desc} (id={runner["id"]}) — удаляем')
-                        deregister_runner_from_gitlab(runner['id'], desc)
-                        stale_count += 1
+                if container_name and container_name not in live_containers:
+                    logger.warning(f'[CLEANUP] Stale runner: {container_name} (id={runner["id"]})', extra={
+                        'description': desc,
+                        'runner_id': runner['id']
+                    })
+                    gitlab_deregister_runner(runner['id'])
+                    stale_count += 1
 
-            if int(resp.headers.get('X-Next-Page', 0)) == 0:
-                break
-            page += 1
-
-        if stale_count == 0:
-            logger.info('✅ Мёртвых раннеров не найдено')
-        else:
-            logger.info(f'✅ Удалено мёртвых раннеров: {stale_count}')
+        logger.info(f'[CLEANUP] Completed: removed {stale_count} stale runners', extra={
+            'stale_count': stale_count
+        })
 
     except Exception as e:
-        logger.error(f'❌ Ошибка очистки мёртвых раннеров: {e}')
+        logger.error(f'[CLEANUP] Error: {e}', extra={'error': str(e)})
 
 
-def deregister_runner_from_gitlab(runner_id, container_name):
+def cleanup_stopped_runners():
     """
-    Удаляет раннер из GitLab через API.
-    Возвращает True если успешно (или раннер уже не существует).
+    Remove stopped runner containers that have been stopped for longer than GRACEFUL_PERIOD.
     """
     try:
-        resp = requests.delete(
-            f'{GITLAB_URL}/api/v4/runners/{runner_id}',
-            headers={'PRIVATE-TOKEN': GITLAB_TOKEN},
-            timeout=10
-        )
-        if resp.status_code == 204:
-            logger.info(f'✅ Раннер {container_name} (id={runner_id}) удалён из GitLab')
-            return True
-        elif resp.status_code == 404:
-            logger.info(f'ℹ️ Раннер {runner_id} уже не существует в GitLab')
-            return True  # Цель достигнута — раннера нет
-        else:
-            logger.warning(f'⚠️ GitLab вернул {resp.status_code} при удалении раннера {runner_id}')
-            return False
+        stopped = get_stopped_runners()
+        now = datetime.now()
+        removed_count = 0
+
+        for container in stopped:
+            # Get container stop time
+            state = container.attrs.get('State', {})
+            stopped_at_str = state.get('StoppedAt', '')
+
+            if stopped_at_str:
+                try:
+                    # Parse ISO format timestamp
+                    # Docker возвращает формат: "2024-01-15T10:30:00.123456789Z"
+                    # Обрезаем наносекунды до микросекунд и убираем Z
+                    stopped_at_clean = stopped_at_str
+                    if '.' in stopped_at_clean:
+                        date_part, frac = stopped_at_clean.split('.', 1)
+                        frac = frac.rstrip('Z')[:6]  # max 6 цифр для микросекунд
+                        stopped_at_clean = f'{date_part}.{frac}'
+                    else:
+                        stopped_at_clean = stopped_at_clean.rstrip('Z')
+                    stopped_at = datetime.fromisoformat(stopped_at_clean)
+                    elapsed = (now - stopped_at).total_seconds()
+
+                    if elapsed > GRACEFUL_PERIOD:
+                        # Remove from GitLab first
+                        runner_id = get_runner_id_by_container(container)
+                        if runner_id:
+                            gitlab_deregister_runner(runner_id)
+
+                        # Remove container
+                        container.remove()
+                        removed_count += 1
+
+                        logger.info(f'[CLEANUP] Removed stopped runner: {container.name}', extra={
+                            'container': container.name,
+                            'stopped_duration_seconds': elapsed
+                        })
+                except Exception as e:
+                    logger.warning(f'Failed to parse stop time for {container.name}: {e}')
+            else:
+                # No stop time, just remove
+                container.remove()
+                removed_count += 1
+
+        if removed_count > 0:
+            logger.info(f'[CLEANUP] Removed {removed_count} stopped runner(s)', extra={
+                'removed_count': removed_count
+            })
+
     except Exception as e:
-        logger.error(f'❌ Ошибка деrегистрации раннера {runner_id}: {e}')
-        return False
+        logger.error(f'[CLEANUP] Error removing stopped runners: {e}', extra={'error': str(e)})
 
 
 def stop_runner():
     """
-    Останавливаем и удаляем лишнего раннера с graceful shutdown.
-    Не убиваем раннеры с активными джобами.
+    Stop and remove an idle runner with graceful shutdown.
     """
     global last_scale_down_time
 
@@ -713,10 +1092,8 @@ def stop_runner():
         if not containers:
             return False
 
-        # Сортируем по времени создания (самый старый первый)
         sorted_containers = sorted(containers, key=lambda c: c.attrs['Created'])
 
-        # Ищем раннер без активных джоб
         to_remove = None
         runner_id = None
         for container in sorted_containers:
@@ -727,56 +1104,86 @@ def stop_runner():
                 break
 
         if to_remove is None:
-            logger.info('⏳ Все раннеры заняты, откладываем остановку')
+            logger.info('[SCALE DOWN] Skip: all runners are busy', extra={
+                'reason': 'all_busy'
+            })
             metrics_scale_down_blocked_jobs.inc()
             return False
 
-        # Шаг 1: Деrегистрируем раннер в GitLab через API
+        # Deregister from GitLab
         if runner_id is not None:
-            deregister_runner_from_gitlab(runner_id, to_remove.name)
+            gitlab_deregister_runner(runner_id)
         else:
-            # Фолбэк: пробуем через exec внутри контейнера
-            logger.warning(f'⚠️ Раннер {to_remove.name} не найден в GitLab API, пробуем unregister внутри контейнера')
+            logger.warning(f'[SCALE DOWN] Runner not found in GitLab: {to_remove.name}', extra={
+                'container': to_remove.name
+            })
             try:
                 exit_code, output = to_remove.exec_run(
                     'gitlab-runner unregister --all-runners',
                     demux=True
                 )
                 if exit_code == 0:
-                    logger.info(f'✅ Unregister через exec успешен для {to_remove.name}')
-                else:
-                    logger.warning(f'⚠️ Unregister через exec завершился с кодом {exit_code}')
+                    logger.info(f'[SCALE DOWN] Unregister via exec successful', extra={'container': to_remove.name})
             except Exception as e:
-                logger.error(f'❌ Exec unregister упал: {e}')
+                logger.error(f'[SCALE DOWN] Exec unregister failed: {e}', extra={'error': str(e)})
 
-        # Шаг 2: Останавливаем и удаляем контейнер
+        # Stop container
         to_remove.stop(timeout=GRACEFUL_PERIOD)
         volume_name = f'{to_remove.name}-config'
         to_remove.remove()
 
-        # Шаг 3: Удаляем volume
+        # Remove volume
         try:
             docker_client.volumes.get(volume_name).remove()
         except Exception:
             pass
 
-        logger.info(f'🛑 Остановлен: {to_remove.name}')
+        logger.info(f'[SCALE DOWN] Runner stopped: {to_remove.name}', extra={
+            'action': 'scale_down',
+            'container': to_remove.name
+        })
+
         last_scale_down_time = datetime.now()
         metrics_scale_down_total.inc()
         return True
+
     except Exception as e:
-        logger.error(f'❌ Ошибка остановки раннера: {e}')
+        logger.error(f'[SCALE DOWN] Stop error: {e}', extra={'error': str(e)})
         return False
 
 
-
-
 def ensure_min_runners():
-    """🔥 Гарантируем запуск минимум MIN_RUNNERS при старте"""
+    """Ensure minimum runners are running at startup"""
     running = get_running_runners()
+    stopped = get_stopped_runners()
+
+    # Сначала чистим stopped контейнеры от предыдущего запуска
+    if stopped:
+        logger.info(f'[RECOVERY] Cleaning {len(stopped)} stopped runner(s) before recovery', extra={
+            'stopped_runners': [c.name for c in stopped],
+        })
+        for container in stopped:
+            try:
+                runner_id = get_runner_id_by_container(container)
+                if runner_id:
+                    gitlab_deregister_runner(runner_id)
+                volume_name = f'{container.name}-config'
+                container.remove()
+                try:
+                    docker_client.volumes.get(volume_name).remove()
+                except Exception:
+                    pass
+            except Exception as e:
+                logger.warning(f'[RECOVERY] Failed to clean stopped runner {container.name}: {e}')
+
     if running < MIN_RUNNERS:
-        logger.info(f'📦 Пре-запуск: нужно {MIN_RUNNERS}, есть {running}. Запускаем {MIN_RUNNERS - running}')
-        for _ in range(MIN_RUNNERS - running):
+        needed = MIN_RUNNERS - running
+        logger.info(f'[RECOVERY] Starting runners: need {needed} (current={running}, min={MIN_RUNNERS})', extra={
+            'needed': needed,
+            'current': running,
+            'min': MIN_RUNNERS
+        })
+        for _ in range(needed):
             if get_running_runners() >= MIN_RUNNERS:
                 break
             start_runner()
@@ -786,8 +1193,7 @@ def ensure_min_runners():
 
 def get_total_runner_capacity():
     """
-    Считаем общую мощность раннеров (сколько задач могут выполнять параллельно).
-    Учитывает concurrent каждого раннера.
+    Calculate total runner capacity (how many jobs can run in parallel).
     """
     try:
         containers = docker_client.containers.list(
@@ -795,96 +1201,146 @@ def get_total_runner_capacity():
         )
         total_capacity = 0
         for container in containers:
-            # Получаем concurrent из labels или используем дефолт
             profile = get_runner_profile(container)
             profile_config = RUNNER_PROFILES.get(profile, RUNNER_PROFILES['medium'])
             total_capacity += profile_config['concurrent']
         return total_capacity
     except Exception as e:
-        logger.error(f'❌ Ошибка подсчёта мощности раннеров: {e}')
+        logger.error(f'Failed to calculate runner capacity', extra={'error': str(e)})
         return 0
 
 
 def update_metrics():
-    """Обновляет Prometheus метрики"""
-    global current_pending_jobs, current_running_runners
+    """Update Prometheus metrics"""
+    global current_pending_jobs, current_running_runners, current_running_jobs
 
     metrics_pending_jobs.set(current_pending_jobs)
+    metrics_running_jobs.set(current_running_jobs)
     metrics_running_runners.set(current_running_runners)
 
     count_runners_by_profile()
     for profile, count in runners_by_profile.items():
         metrics_running_runners_by_profile.labels(profile=profile).set(count)
 
+    # Uptime
+    uptime = (datetime.now() - startup_time).total_seconds()
+    metrics_uptime_seconds.set(uptime)
+
+
+# =============================================================================
+# Main loop
+# =============================================================================
 
 def main():
     global last_scale_up_time, last_scale_down_time
-    global current_pending_jobs, current_running_runners
+    global current_pending_jobs, current_running_runners, current_running_jobs
+    global last_gitlab_check
 
-    logger.info('🎯 Автоскейлер запущен')
-    logger.info(f'📊 GitLab: {GITLAB_URL} | Min: {MIN_RUNNERS} | Max: {MAX_RUNNERS} | Interval: {CHECK_INTERVAL}s')
-    logger.info(f'⏱️ Cooldown: up={SCALE_UP_COOLDOWN}s, down={SCALE_DOWN_COOLDOWN}s')
-    logger.info(f'📊 Пороги ресурсов: CPU={CPU_THRESHOLD}%, RAM={RAM_THRESHOLD}%')
-    logger.info(f'🕐 Graceful shutdown: {GRACEFUL_PERIOD}s')
-    logger.info(f'🏷️ Профили: small/medium/large (default: {DEFAULT_RUNNER_PROFILE})')
+    logger.info('[STARTUP] Starting GitLab Runner Autoscaler', extra={
+        'gitlab_url': GITLAB_URL,
+        'min_runners': MIN_RUNNERS,
+        'max_runners': MAX_RUNNERS,
+        'check_interval': CHECK_INTERVAL,
+    })
 
-    # Запуск сервера метрик
+    # Validate configuration
+    try:
+        validate_config()
+    except ConfigValidationError as e:
+        logger.error(f'[STARTUP] Configuration error: {e}')
+        sys.exit(1)
+
+    # Check Docker connection
+    if docker_client is None:
+        logger.error('[STARTUP] Docker client not initialized')
+        sys.exit(1)
+
+    try:
+        validate_docker_connection(docker_client)
+    except ConfigValidationError as e:
+        logger.error(f'[STARTUP] Docker connection error: {e}')
+        sys.exit(1)
+
+    # Check GitLab connection
+    try:
+        validate_gitlab_connection()
+        last_gitlab_check = datetime.now()
+    except ConfigValidationError as e:
+        logger.error(f'[STARTUP] GitLab connection error: {e}')
+        sys.exit(1)
+
+    # Start metrics server
     metrics_port = int(os.getenv('METRICS_PORT', '8000'))
     start_metrics_server(metrics_port)
 
-    # 🧹 Чистим мёртвые раннеры в GitLab которые остались от прошлых запусков
+    # Cleanup stale runners
     cleanup_stale_gitlab_runners()
 
-    # 🔥 Сразу обеспечиваем минимум раннеров
+    # Cleanup stopped runners
+    cleanup_stopped_runners()
+
+    # Ensure minimum runners
     ensure_min_runners()
 
+    logger.info('[STARTUP] Autoscaler ready')
+
+    # Main loop
     while True:
-        pending, jobs_running = get_queue_stats()
-        running = get_running_runners()
-        capacity = get_total_runner_capacity()
+        try:
+            pending, jobs_running = get_queue_stats()
+            running = get_running_runners()
+            capacity = get_total_runner_capacity()
 
-        # Общий спрос = pending (ждут) + running (уже выполняются)
-        # Scale up нужен, когда pending > 0 — т.е. есть джобы, которым не хватило слотов
-        total_demand = pending + jobs_running
+            current_pending_jobs = pending
+            current_running_runners = running
+            current_running_jobs = jobs_running
+            last_gitlab_check = datetime.now()
 
-        current_pending_jobs = pending
-        current_running_runners = running
+            logger.info(f'[QUEUE] Queue: {pending} pending, {jobs_running} running | Runners: {running}/{capacity} (min={MIN_RUNNERS}, max={MAX_RUNNERS})')
 
-        logger.info(
-            f'📈 Pending: {pending} | Running jobs: {jobs_running} | '
-            f'Раннеры: {running} | Мощность: {capacity} '
-            f'(min: {MIN_RUNNERS}, max: {MAX_RUNNERS})'
-        )
-
-        # Обновление метрик
-        update_metrics()
-
-        # 🔥 Восстановление до MIN_RUNNERS (если раннер упал)
-        if running < MIN_RUNNERS:
-            logger.info(f'🚑 Восстановление: нужно {MIN_RUNNERS}, есть {running}')
-            start_runner()
-            time.sleep(2)
             update_metrics()
-            continue
 
-        # Scale UP: есть pending джобы И не достигли лимита раннеров
-        # Сравниваем суммарный спрос с суммарной мощностью
-        if pending > 0 and total_demand > capacity and running < MAX_RUNNERS:
-            if can_scale_up():
-                logger.info(f'⬆️ Масштабирование вверх (спрос {total_demand} > мощность {capacity})')
-                start_runner()
-                update_metrics()
-            else:
-                logger.info('⏸️ Scale up отложен (cooldown или ресурсы)')
+            # Periodic cleanup of stopped runners
+            cleanup_stopped_runners()
 
-        # Scale DOWN: pending=0 И running jobs < capacity (раннеры простаивают) И выше минимума
-        elif pending == 0 and jobs_running < capacity and running > MIN_RUNNERS:
-            if can_scale_down():
-                logger.info('⬇️ Масштабирование вниз')
-                stop_runner()
-                update_metrics()
-            else:
-                logger.info('⏸️ Scale down отложен (cooldown или активные джобы)')
+            # Recovery to MIN_RUNNERS
+            if running < MIN_RUNNERS:
+                stopped = get_stopped_runners()
+                if stopped:
+                    # cleanup_stopped_runners() уже запущен выше, просто пропускаем цикл
+                    logger.info(f'[RECOVERY] Skipping recovery: {len(stopped)} stopped runner(s) exist', extra={
+                        'stopped_runners': [c.name for c in stopped],
+                        'running': running,
+                        'min': MIN_RUNNERS
+                    })
+                else:
+                    logger.info(f'[RECOVERY] Recovering runners: current={running}, min={MIN_RUNNERS}')
+                    start_runner()
+                    time.sleep(2)
+                    update_metrics()
+                    continue  # пропускаем scale up/down — раннер только что стартовал
+
+            # Scale UP
+            total_demand = pending + jobs_running
+            if pending > 0 and total_demand > capacity and running < MAX_RUNNERS:
+                if can_scale_up():
+                    logger.info(f'[SCALE UP] Starting runner: demand={total_demand}, capacity={capacity}')
+                    start_runner()
+                    update_metrics()
+                else:
+                    logger.info('[SCALE UP] Deferred (cooldown or resources)')
+
+            # Scale DOWN
+            elif pending == 0 and jobs_running < capacity and running > MIN_RUNNERS:
+                if can_scale_down():
+                    logger.info('[SCALE DOWN] Stopping runner: queue empty')
+                    stop_runner()
+                    update_metrics()
+                else:
+                    logger.info('[SCALE DOWN] Deferred (cooldown or active jobs)')
+
+        except Exception as e:
+            logger.error(f'[ERROR] Main loop error: {e}', extra={'error': str(e)})
 
         time.sleep(CHECK_INTERVAL)
 
