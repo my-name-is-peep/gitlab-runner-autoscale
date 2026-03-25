@@ -22,6 +22,10 @@
 - 🔍 **Расширенная статистика очереди** — отслеживание pending-задач по профилям (small/medium/large/any)
 - 📈 **Мониторинг мощности** — отслеживание общей мощности раннеров по профилям
 - 🔄 **Периодическая очистка** — автоматическая очистка stopped контейнеров каждые `CHECK_INTERVAL` секунд
+- 🔒 **Валидация конфигурации** — проверка всех параметров при старте
+- 🔍 **Мониторинг задержек API** — отслеживание времени отклика GitLab API
+- 📊 **Метрики uptime** — время работы автоскейлера
+- 🔄 **Exponential backoff** — интеллектуальные повторные попытки с увеличением задержки
 
 ## Быстрый старт
 
@@ -198,6 +202,9 @@ curl http://localhost:8000/ready
 | `gitlab_autoscaler_host_cpu_percent` | Gauge | Загрузка CPU хоста |
 | `gitlab_autoscaler_host_ram_percent` | Gauge | Использование RAM хоста |
 | `gitlab_autoscaler_info` | Info | Информация об автоскейлере |
+| `gitlab_autoscaler_api_requests_total` | Counter | Общее количество запросов к GitLab API (по статусам) |
+| `gitlab_autoscaler_api_latency_seconds` | Gauge | Последняя задержка запроса к GitLab API |
+| `gitlab_autoscaler_uptime_seconds` | Gauge | Время работы автоскейлера в секундах |
 
 ### Пример scrape-конфигурации для Prometheus
 
