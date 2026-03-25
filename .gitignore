@@ -1,1 +1,44 @@
-QWEN.md
+# Git
+.git
+.gitignore
+
+# Документы
+README.md
+*.md
+
+# Конфигурация окружения
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Тесты
+tests/
+test_*.py
+*_test.py
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Логи
+*.log
+logs/
+
+# Временные файлы
+*.tmp
+*.bak
+.DS_Store
+Thumbs.db
