@@ -779,19 +779,7 @@ def count_runners_by_profile():
 
 
 def get_queue_stats():
-    """
-    Get pending and running jobs count from all available projects.
-    Also returns pending jobs grouped by required runner profile.
-    Returns: (total_pending, total_running, pending_by_profile)
-    pending_by_profile = {'small': N, 'medium': N, 'large': N, 'any': N}
-    """
-    # Строим маппинг тег → профиль из конфига
-    # Например: 'small' -> 'small', 'medium' -> 'medium', 'large' -> 'large'
-    tag_to_profile = {}
-    for profile_name, profile_cfg in RUNNER_PROFILES.items():
-        for tag in profile_cfg['tags'].split(','):
-            tag_to_profile[tag.strip()] = profile_name
-
+    """Get pending and running jobs count from all available projects"""
     try:
         projects_resp = gitlab_get(
             f'{GITLAB_URL}/api/v4/projects',
@@ -802,7 +790,6 @@ def get_queue_stats():
 
         total_pending = 0
         total_running = 0
-        pending_by_profile = {'small': 0, 'medium': 0, 'large': 0, 'any': 0}
 
         for project in projects:
             for scope in ['pending', 'running']:
@@ -812,88 +799,21 @@ def get_queue_stats():
                         params={'scope': scope, 'per_page': 100},
                         timeout=5
                     )
-                    jobs = jobs_resp.json()
+                    x_total = jobs_resp.headers.get('X-Total')
+                    count = int(x_total) if x_total is not None else len(jobs_resp.json())
 
-                    if scope == 'running':
-                        x_total = jobs_resp.headers.get('X-Total')
-                        total_running += int(x_total) if x_total is not None else len(jobs)
+                    if scope == 'pending':
+                        total_pending += count
                     else:
-                        # Для pending — смотрим теги каждой джобы
-                        for job in jobs:
-                            total_pending += 1
-                            job_tags = [t.strip() for t in job.get('tag_list', [])]
-
-                            # Определяем нужный профиль по тегам джобы
-                            matched_profile = None
-                            for tag in job_tags:
-                                if tag in tag_to_profile:
-                                    matched_profile = tag_to_profile[tag]
-                                    break
-
-                            if matched_profile:
-                                pending_by_profile[matched_profile] += 1
-                            else:
-                                # Нет тега профиля — подойдёт любой раннер
-                                pending_by_profile['any'] += 1
-
+                        total_running += count
                 except Exception:
                     continue
 
-        return total_pending, total_running, pending_by_profile
+        return total_pending, total_running
 
     except Exception as e:
         logger.error(f'Failed to get queue stats', extra={'error': str(e)})
-        return 0, 0, {'small': 0, 'medium': 0, 'large': 0, 'any': 0}
-
-
-def get_needed_profile(pending_by_profile):
-    """
-    Определяет какой профиль раннера нужно поднять следующим.
-    Приоритет: сначала профили с конкретными тегами, потом 'any'.
-    Возвращает название профиля или DEFAULT_RUNNER_PROFILE.
-    """
-    # Сначала проверяем конкретные профили (small/medium/large)
-    for profile in RUNNER_PROFILES:
-        if pending_by_profile.get(profile, 0) > 0:
-            # Проверяем — нет ли уже раннера этого профиля
-            return profile
-
-    # Если есть джобы без тега профиля — поднимаем дефолтный
-    if pending_by_profile.get('any', 0) > 0:
-        return DEFAULT_RUNNER_PROFILE
-
-    return DEFAULT_RUNNER_PROFILE
-
-
-def get_capacity_by_profile():
-    """
-    Считает мощность раннеров сгруппированную по профилям.
-    Возвращает dict {'small': N, 'medium': N, 'large': N}
-    """
-    result = {p: 0 for p in RUNNER_PROFILES}
-    try:
-        containers = docker_client.containers.list(
-            filters={'name': 'autoscale-runner-', 'status': 'running'}
-        )
-        for container in containers:
-            profile = get_runner_profile(container)
-            if profile in result:
-                result[profile] += RUNNER_PROFILES[profile]['concurrent']
-    except Exception as e:
-        logger.error(f'Failed to get capacity by profile', extra={'error': str(e)})
-    return result
-
-
-
-    """Count running runner containers"""
-    try:
-        containers = docker_client.containers.list(
-            filters={'name': 'autoscale-runner-', 'status': 'running'}
-        )
-        return len(containers)
-    except Exception as e:
-        logger.error(f'Failed to get running runners', extra={'error': str(e)})
-        return 0
+        return 0, 0
 
 
 def get_running_runners():
@@ -1367,22 +1287,16 @@ def main():
     # Main loop
     while True:
         try:
-            pending, jobs_running, pending_by_profile = get_queue_stats()
+            pending, jobs_running = get_queue_stats()
             running = get_running_runners()
             capacity = get_total_runner_capacity()
-            capacity_by_profile = get_capacity_by_profile()
 
             current_pending_jobs = pending
             current_running_runners = running
             current_running_jobs = jobs_running
             last_gitlab_check = datetime.now()
 
-            logger.info(
-                f'[QUEUE] Queue: {pending} pending, {jobs_running} running | '
-                f'Runners: {running}/{capacity} (min={MIN_RUNNERS}, max={MAX_RUNNERS}) | '
-                f'Pending by profile: {pending_by_profile}',
-                extra={'pending_by_profile': pending_by_profile}
-            )
+            logger.info(f'[QUEUE] Queue: {pending} pending, {jobs_running} running | Runners: {running}/{capacity} (min={MIN_RUNNERS}, max={MAX_RUNNERS})')
 
             update_metrics()
 
@@ -1393,6 +1307,7 @@ def main():
             if running < MIN_RUNNERS:
                 stopped = get_stopped_runners()
                 if stopped:
+                    # cleanup_stopped_runners() уже запущен выше, просто пропускаем цикл
                     logger.info(f'[RECOVERY] Skipping recovery: {len(stopped)} stopped runner(s) exist', extra={
                         'stopped_runners': [c.name for c in stopped],
                         'running': running,
@@ -1405,26 +1320,12 @@ def main():
                     update_metrics()
                     continue  # пропускаем scale up/down — раннер только что стартовал
 
-            # Scale UP — с учётом нужного профиля
+            # Scale UP
             total_demand = pending + jobs_running
             if pending > 0 and total_demand > capacity and running < MAX_RUNNERS:
                 if can_scale_up():
-                    needed_profile = get_needed_profile(pending_by_profile)
-
-                    # Проверяем — есть ли уже раннер нужного профиля с запасом
-                    profile_capacity = capacity_by_profile.get(needed_profile, 0)
-                    profile_pending = pending_by_profile.get(needed_profile, 0) + pending_by_profile.get('any', 0)
-
-                    logger.info(
-                        f'[SCALE UP] Starting {needed_profile} runner: '
-                        f'profile_pending={profile_pending}, profile_capacity={profile_capacity}',
-                        extra={
-                            'needed_profile': needed_profile,
-                            'profile_pending': profile_pending,
-                            'profile_capacity': profile_capacity,
-                        }
-                    )
-                    start_runner(profile=needed_profile)
+                    logger.info(f'[SCALE UP] Starting runner: demand={total_demand}, capacity={capacity}')
+                    start_runner()
                     update_metrics()
                 else:
                     logger.info('[SCALE UP] Deferred (cooldown or resources)')
@@ -1442,7 +1343,6 @@ def main():
             logger.error(f'[ERROR] Main loop error: {e}', extra={'error': str(e)})
 
         time.sleep(CHECK_INTERVAL)
-
 
 
 if __name__ == '__main__':
