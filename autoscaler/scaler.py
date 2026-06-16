@@ -286,6 +286,7 @@ except Exception as e:
 
 last_scale_up_time = None
 last_scale_down_time = None
+scaling_in_progress = False
 
 current_pending_jobs = 0
 current_running_runners = 0
@@ -591,7 +592,9 @@ def get_host_resources():
     Returns tuple (cpu_percent, ram_percent).
     """
     try:
-        containers = docker_client.containers.list()
+        containers = docker_client.containers.list(
+            filters={'label': 'autoscale-runner'}
+        )
 
         cpu_total = 0.0
         ram_used = 0
@@ -846,19 +849,18 @@ def get_queue_stats():
         return 0, 0, {'small': 0, 'medium': 0, 'large': 0, 'any': 0}
 
 
-def get_needed_profile(pending_by_profile):
+def get_needed_profile(pending_by_profile, capacity_by_profile):
     """
     Определяет какой профиль раннера нужно поднять следующим.
     Приоритет: сначала профили с конкретными тегами, потом 'any'.
     Возвращает название профиля или DEFAULT_RUNNER_PROFILE.
     """
-    # Сначала проверяем конкретные профили (small/medium/large)
     for profile in RUNNER_PROFILES:
-        if pending_by_profile.get(profile, 0) > 0:
-            # Проверяем — нет ли уже раннера этого профиля
+        needed = pending_by_profile.get(profile, 0)
+        available = capacity_by_profile.get(profile, 0)
+        if needed > available:
             return profile
 
-    # Если есть джобы без тега профиля — поднимаем дефолтный
     if pending_by_profile.get('any', 0) > 0:
         return DEFAULT_RUNNER_PROFILE
 
@@ -882,18 +884,6 @@ def get_capacity_by_profile():
     except Exception as e:
         logger.error(f'Failed to get capacity by profile', extra={'error': str(e)})
     return result
-
-
-
-    """Count running runner containers"""
-    try:
-        containers = docker_client.containers.list(
-            filters={'name': 'autoscale-runner-', 'status': 'running'}
-        )
-        return len(containers)
-    except Exception as e:
-        logger.error(f'Failed to get running runners', extra={'error': str(e)})
-        return 0
 
 
 def get_running_runners():
@@ -1312,7 +1302,7 @@ def update_metrics():
 # =============================================================================
 
 def main():
-    global last_scale_up_time, last_scale_down_time
+    global last_scale_up_time, last_scale_down_time, scaling_in_progress
     global current_pending_jobs, current_running_runners, current_running_jobs
     global last_gitlab_check
 
@@ -1406,31 +1396,33 @@ def main():
                     continue  # пропускаем scale up/down — раннер только что стартовал
 
             # Scale UP — с учётом нужного профиля
-            total_demand = pending + jobs_running
-            if pending > 0 and total_demand > capacity and running < MAX_RUNNERS:
+            if pending > 0 and running < MAX_RUNNERS and not scaling_in_progress:
                 if can_scale_up():
-                    needed_profile = get_needed_profile(pending_by_profile)
+                    scaling_in_progress = True
+                    try:
+                        needed_profile = get_needed_profile(pending_by_profile, capacity_by_profile)
 
-                    # Проверяем — есть ли уже раннер нужного профиля с запасом
-                    profile_capacity = capacity_by_profile.get(needed_profile, 0)
-                    profile_pending = pending_by_profile.get(needed_profile, 0) + pending_by_profile.get('any', 0)
+                        profile_capacity = capacity_by_profile.get(needed_profile, 0)
+                        profile_pending = pending_by_profile.get(needed_profile, 0) + pending_by_profile.get('any', 0)
 
-                    logger.info(
-                        f'[SCALE UP] Starting {needed_profile} runner: '
-                        f'profile_pending={profile_pending}, profile_capacity={profile_capacity}',
-                        extra={
-                            'needed_profile': needed_profile,
-                            'profile_pending': profile_pending,
-                            'profile_capacity': profile_capacity,
-                        }
-                    )
-                    start_runner(profile=needed_profile)
-                    update_metrics()
+                        logger.info(
+                            f'[SCALE UP] Starting {needed_profile} runner: '
+                            f'profile_pending={profile_pending}, profile_capacity={profile_capacity}',
+                            extra={
+                                'needed_profile': needed_profile,
+                                'profile_pending': profile_pending,
+                                'profile_capacity': profile_capacity,
+                            }
+                        )
+                        start_runner(profile=needed_profile)
+                        update_metrics()
+                    finally:
+                        scaling_in_progress = False
                 else:
                     logger.info('[SCALE UP] Deferred (cooldown or resources)')
 
             # Scale DOWN
-            elif pending == 0 and jobs_running < capacity and running > MIN_RUNNERS:
+            elif pending == 0 and jobs_running < capacity and running > MIN_RUNNERS and not scaling_in_progress:
                 if can_scale_down():
                     logger.info('[SCALE DOWN] Stopping runner: queue empty')
                     stop_runner()
